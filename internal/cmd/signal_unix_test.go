@@ -331,6 +331,39 @@ func TestRepeatedTerminateDuringRunCleanup(t *testing.T) {
 	}
 }
 
+// A standalone coordinator must unregister before it exits on a signal.
+func TestCoordinatorSignalShutdown(t *testing.T) {
+	for _, shutdownSignal := range []os.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(shutdownSignal.String(), func(t *testing.T) {
+			th := test.SetupCommand(t, test.WithBuiltExecutable())
+			args := test.WithConfigFlag([]string{"coordinator", "--coordinator.port=" + findPort(t), "--coordinator.health-port=0"}, th.Config)
+			command := exec.Command(th.Config.Paths.Executable, args...) //nolint:gosec // Test executes the repository binary.
+			command.Env = th.ChildEnv
+			logFile, err := os.CreateTemp(t.TempDir(), "coordinator-*.log")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = logFile.Close() })
+			command.Stdout, command.Stderr = logFile, logFile
+			require.NoError(t, command.Start())
+			waitCh := make(chan error, 1)
+			go func() { waitCh <- command.Wait() }()
+			run := &signalRun{th: th, command: command, waitCh: waitCh, logFile: logFile}
+			t.Cleanup(func() {
+				if !run.exited {
+					terminateTestCommand(command, waitCh)
+				}
+			})
+			require.Eventually(t, func() bool {
+				return strings.Contains(run.output(), "Registered with service registry")
+			}, commandLogWaitTimeout(), 20*time.Millisecond, "output: %s", run.output())
+			require.NoError(t, command.Process.Signal(shutdownSignal))
+			require.NoError(t, run.wait(t), "output: %s", run.output())
+			entries, err := os.ReadDir(filepath.Join(th.Config.Paths.ServiceRegistryDir, "coordinator"))
+			require.NoError(t, err)
+			require.Empty(t, entries, "registry entry left behind")
+		})
+	}
+}
+
 func TestSchedulerUnsupportedSignal(t *testing.T) {
 	for _, shutdownSignal := range []os.Signal{syscall.SIGHUP, syscall.SIGQUIT} {
 		t.Run(shutdownSignal.String(), func(t *testing.T) {
