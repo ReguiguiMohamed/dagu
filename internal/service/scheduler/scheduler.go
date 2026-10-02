@@ -243,11 +243,7 @@ func newScheduler(
 	var enqueueFunc EnqueueFunc
 	if queuesEnabled {
 		isQueued = func(ctx context.Context, dag *ir.DAG) (bool, error) {
-			items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
-			if err != nil {
-				return false, err
-			}
-			return len(items) > 0, nil
+			return hasQueuedRun(ctx, queueStore, dagRunRepository, dag)
 		}
 		enqueueFunc = func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error {
 			dag := entry.DAG
@@ -981,4 +977,31 @@ func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
 		}
 	}()
 	s.planner.DispatchRun(ctx, run)
+}
+
+// hasQueuedRun reports whether a run the scheduler owns is queued for dag.
+// Runs queued by hand or by webhook do not hold back the schedule.
+func hasQueuedRun(ctx context.Context, queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository, dag *ir.DAG) (bool, error) {
+	items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		ref, err := item.Data()
+		if err != nil {
+			return false, err
+		}
+		attempt, err := dagRunRepository.FindAttempt(ctx, *ref)
+		if err != nil {
+			return false, err
+		}
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil {
+			return false, err
+		}
+		if isSchedulerManagedTriggerType(status.TriggerType) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
