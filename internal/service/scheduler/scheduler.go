@@ -242,9 +242,7 @@ func newScheduler(
 	var isQueued IsQueuedFunc
 	var enqueueFunc EnqueueFunc
 	if queuesEnabled {
-		isQueued = func(ctx context.Context, dag *ir.DAG) (bool, error) {
-			return hasQueuedRun(ctx, queueStore, dagRunRepository, dag)
-		}
+		isQueued = newQueuedChecker(queueStore, dagRunRepository)
 		enqueueFunc = func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error {
 			dag := entry.DAG
 			profileName, err := dagExecutor.defaultProfileName(ctx, entry.DefinitionID, dag)
@@ -979,29 +977,31 @@ func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
 	s.planner.DispatchRun(ctx, run)
 }
 
-// hasQueuedRun reports whether a run the scheduler owns is queued for dag.
-// Runs queued by hand or by webhook do not hold back the schedule.
-func hasQueuedRun(ctx context.Context, queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository, dag *ir.DAG) (bool, error) {
-	items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
-	if err != nil {
-		return false, err
+// newQueuedChecker reports whether a run the scheduler owns is queued for a
+// DAG. Runs queued by hand or by webhook do not hold back the schedule.
+func newQueuedChecker(queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository) IsQueuedFunc {
+	return func(ctx context.Context, dag *ir.DAG) (bool, error) {
+		items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
+		if err != nil {
+			return false, err
+		}
+		for _, item := range items {
+			ref, err := item.Data()
+			if err != nil {
+				return false, err
+			}
+			attempt, err := dagRunRepository.FindAttempt(ctx, *ref)
+			if err != nil {
+				return false, err
+			}
+			status, err := attempt.ReadStatus(ctx)
+			if err != nil {
+				return false, err
+			}
+			if isSchedulerManagedTriggerType(status.TriggerType) {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
-	for _, item := range items {
-		ref, err := item.Data()
-		if err != nil {
-			return false, err
-		}
-		attempt, err := dagRunRepository.FindAttempt(ctx, *ref)
-		if err != nil {
-			return false, err
-		}
-		status, err := attempt.ReadStatus(ctx)
-		if err != nil {
-			return false, err
-		}
-		if isSchedulerManagedTriggerType(status.TriggerType) {
-			return true, nil
-		}
-	}
-	return false, nil
 }

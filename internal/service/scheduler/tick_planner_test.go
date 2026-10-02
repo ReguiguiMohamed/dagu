@@ -16,7 +16,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/intake"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1406,6 +1414,132 @@ func TestTickPlanner_IsQueuedErrorDefersCatchupWithoutDroppingState(t *testing.T
 	assert.Equal(t, hadInitialWatermark, hasDeferredWatermark)
 	if hadInitialWatermark {
 		assert.Equal(t, initialWatermark.LastScheduledTime, deferWatermark.LastScheduledTime)
+	}
+}
+
+// How a planned run was started, as recorded by queuedRunFixture.
+const (
+	runNotStarted = ""
+	runDispatched = "dispatch"
+	runEnqueued   = "enqueue"
+)
+
+// queuedRunFixture plans an hourly DAG against real run and queue stores.
+type queuedRunFixture struct {
+	t       *testing.T
+	dir     string
+	dag     *ir.DAG
+	runs    *persis.DAGRunRepository
+	queue   queuedomain.QueueStore
+	started string
+}
+
+func newQueuedRunFixture(t *testing.T) *queuedRunFixture {
+	t.Helper()
+	dir := t.TempDir()
+	return &queuedRunFixture{
+		t:     t,
+		dir:   dir,
+		dag:   &ir.DAG{Name: "queued-dag", Schedule: []ir.Schedule{mustParseSchedule(t, "0 * * * *")}},
+		runs:  testutil.NewFileDAGRunRepository(filepath.Join(dir, "dag-runs"), persis.DAGRunRepositoryOptions{}),
+		queue: store.NewQueueStore(file.NewCollection(filepath.Join(dir, "queue"))),
+	}
+}
+
+// writeRun records a run that has left the queue.
+func (f *queuedRunFixture) writeRun(runID string, status ir.Status, scheduleTime, at time.Time) *ir.DAGRunStatus {
+	f.t.Helper()
+	attempt, err := f.runs.CreateAttempt(f.t.Context(), f.dag, at, runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(f.t, err)
+	st := ir.InitialStatus(f.dag)
+	st.DAGRunID, st.AttemptID, st.Status = runID, attempt.ID(), status
+	st.StartedAt = stringutil.FormatTime(at)
+	st.ScheduleTime = stringutil.FormatTime(scheduleTime)
+	require.NoError(f.t, attempt.Open(f.t.Context()))
+	require.NoError(f.t, attempt.Write(f.t.Context(), st))
+	require.NoError(f.t, attempt.Close(f.t.Context()))
+	return &st
+}
+
+// queueRun enqueues a new run. A zero scheduleTime marks a run that does not
+// come from a schedule.
+func (f *queuedRunFixture) queueRun(runID string, trigger ir.TriggerType, scheduleTime, at time.Time) {
+	f.t.Helper()
+	_, err := intake.EnqueueRun(f.t.Context(), intake.QueueRequest{
+		DAGRunRepository: f.runs,
+		QueueStore:       f.queue,
+		DAG:              f.dag,
+		DAGRunID:         runID,
+		LogBaseDir:       filepath.Join(f.dir, "logs"),
+		ArtifactBaseDir:  filepath.Join(f.dir, "artifacts"),
+		TriggerType:      trigger,
+		ScheduleTime:     stringutil.FormatTime(scheduleTime),
+		Now:              func() time.Time { return at },
+	})
+	require.NoError(f.t, err)
+}
+
+// queueRetry fails a run and queues its retry, which records the retry
+// trigger type in place of the original one.
+func (f *queuedRunFixture) queueRetry(runID string, scheduleTime, at time.Time) {
+	f.t.Helper()
+	status := f.writeRun(runID, ir.Failed, scheduleTime, at)
+	queued, err := queuedomain.EnqueueRetry(f.t.Context(), f.runs, f.queue, f.dag, status, queuedomain.EnqueueRetryOptions{})
+	require.NoError(f.t, err)
+	require.True(f.t, queued)
+}
+
+// planner returns a planner wired to the stores the way the scheduler wires
+// them, recording how each dispatched run is started.
+func (f *queuedRunFixture) planner(now time.Time) *TickPlanner {
+	f.t.Helper()
+	tp, _ := newTestTickPlanner(&mockStateStore{state: newMockState(now.Add(-time.Minute))})
+	manager := runtime.NewManager(f.runs, nil, &config.Config{})
+	tp.cfg.IsQueued = newQueuedChecker(f.queue, f.runs)
+	tp.cfg.GetLatestStatus = manager.GetLatestStatus
+	tp.cfg.Dispatch = func(context.Context, DAGEntry, string, ir.TriggerType, time.Time) error {
+		f.started = runDispatched
+		return nil
+	}
+	tp.cfg.Enqueue = func(context.Context, DAGEntry, string, ir.TriggerType, time.Time) error {
+		f.started = runEnqueued
+		return nil
+	}
+	require.NoError(f.t, tp.Init(f.t.Context(), testDAGEntries(f.dag)))
+	return tp
+}
+
+// Only a queued run that the scheduler owns holds back a due slot.
+func TestPlanQueuedRuns(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	slot := now.Add(-time.Hour)
+	queuedAt := now.Add(-10 * time.Minute)
+	tests := []struct {
+		name  string
+		queue func(f *queuedRunFixture)
+		want  string
+	}{
+		{"Manual", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, queuedAt) }, runDispatched},
+		{"Webhook", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeWebhook, time.Time{}, queuedAt) }, runDispatched},
+		{"Scheduled", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeScheduler, slot, queuedAt) }, runNotStarted},
+		{"CatchUp", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeCatchUp, slot, queuedAt) }, runNotStarted},
+		{"ScheduledRetry", func(f *queuedRunFixture) { f.queueRetry("queued", slot, queuedAt) }, runNotStarted},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newQueuedRunFixture(t)
+			tt.queue(f)
+			tp := f.planner(now)
+
+			for _, run := range tp.Plan(t.Context(), now) {
+				tp.DispatchRun(t.Context(), run)
+			}
+			require.Equal(t, tt.want, f.started)
+		})
 	}
 }
 
