@@ -977,32 +977,61 @@ func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
 	s.planner.DispatchRun(ctx, run)
 }
 
-// newQueuedChecker reports the runs queued for a DAG. Only a run the
-// scheduler owns holds a schedule slot; runs queued by hand or by webhook do
-// not hold back the schedule.
+// newQueuedChecker reports the runs queued for a DAG. Only a run started for
+// a schedule slot holds that slot; runs queued by hand, by webhook or by a
+// parent DAG do not hold back the schedule. Queue items the dispatcher would
+// discard are ignored.
 func newQueuedChecker(queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository) IsQueuedFunc {
 	return func(ctx context.Context, dag *ir.DAG) (bool, bool, error) {
 		items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
 		if err != nil {
 			return false, false, err
 		}
+		queued := false
 		for _, item := range items {
 			ref, err := item.Data()
 			if err != nil {
 				return false, false, err
 			}
-			attempt, err := dagRunRepository.FindAttempt(ctx, *ref)
+			status, err := readQueuedStatus(ctx, dagRunRepository, *ref)
 			if err != nil {
 				return false, false, err
 			}
-			status, err := attempt.ReadStatus(ctx)
-			if err != nil {
-				return false, false, err
+			if status == nil {
+				continue
 			}
-			if isSchedulerManagedTriggerType(status.TriggerType) {
+			// Retries keep the schedule time but not the original trigger type.
+			if status.ScheduleTime != "" {
 				return true, true, nil
 			}
+			queued = true
 		}
-		return len(items) > 0, false, nil
+		return queued, false, nil
 	}
+}
+
+// readQueuedStatus returns the status of a queued run, or nil when the run is
+// gone or no longer queued.
+func readQueuedStatus(ctx context.Context, dagRunRepository *persis.DAGRunRepository, ref ir.DAGRunRef) (*ir.DAGRunStatus, error) {
+	attempt, err := dagRunRepository.FindAttempt(ctx, ref)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) || errors.Is(err, dagrun.ErrNoStatusData) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if attempt.Hidden() {
+		return nil, nil
+	}
+	status, err := attempt.ReadStatusUncached(ctx)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrNoStatusData) || errors.Is(err, dagrun.ErrCorruptedStatusData) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if status == nil || status.Status != ir.Queued {
+		return nil, nil
+	}
+	return status, nil
 }

@@ -1526,6 +1526,16 @@ func TestPlanQueuedRuns(t *testing.T) {
 		{"Scheduled", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeScheduler, slot, queuedAt) }, runNotStarted},
 		{"CatchUp", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeCatchUp, slot, queuedAt) }, runNotStarted},
 		{"ScheduledRetry", func(f *queuedRunFixture) { f.queueRetry("queued", slot, queuedAt) }, runNotStarted},
+		// A manual run resumed after a human task is queued as a retry.
+		{"ManualRetry", func(f *queuedRunFixture) { f.queueRetry("queued", time.Time{}, queuedAt) }, runEnqueued},
+		// Queue items the dispatcher discards hold nothing back.
+		{"MissingRun", func(f *queuedRunFixture) {
+			require.NoError(f.t, f.queue.Enqueue(f.t.Context(), f.dag.ProcGroup(), queuedomain.QueuePriorityLow, ir.NewDAGRunRef(f.dag.Name, "missing")))
+		}, runDispatched},
+		{"FinishedRun", func(f *queuedRunFixture) {
+			f.writeRun("finished", ir.Succeeded, slot, queuedAt)
+			require.NoError(f.t, f.queue.Enqueue(f.t.Context(), f.dag.ProcGroup(), queuedomain.QueuePriorityLow, ir.NewDAGRunRef(f.dag.Name, "finished")))
+		}, runDispatched},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -761,12 +761,12 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 	if running {
 		logger.Info(ctx, "Skipping job because the DAG is running",
 			tag.DAG(dag.Name),
-			slog.String("schedule-time", scheduledTime.Format(time.RFC3339)),
+			tag.ScheduledTime(scheduledTime),
 		)
 		return false
 	}
 
-	// Guard 1b: isQueued, a scheduler-owned run is waiting in the queue.
+	// Guard 1b: isQueued, a run started for a schedule slot is waiting in the queue.
 	// On error, conservatively skip (assume busy) to avoid duplicates.
 	_, scheduled, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
@@ -777,9 +777,9 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 		return false
 	}
 	if scheduled {
-		logger.Info(ctx, "Skipping job because a scheduler-managed run is queued",
+		logger.Info(ctx, "Skipping job because a scheduled run is queued",
 			tag.DAG(dag.Name),
-			slog.String("schedule-time", scheduledTime.Format(time.RFC3339)),
+			tag.ScheduledTime(scheduledTime),
 		)
 		return false
 	}
