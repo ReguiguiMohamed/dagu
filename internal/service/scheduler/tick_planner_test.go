@@ -1370,8 +1370,8 @@ func TestTickPlanner_IsQueuedErrorDefersCatchupWithoutDroppingState(t *testing.T
 		IsRunning: func(_ context.Context, _ *ir.DAG) (bool, error) {
 			return false, nil
 		},
-		IsQueued: func(_ context.Context, _ *ir.DAG) (bool, error) {
-			return false, errors.New("queue read failed")
+		IsQueued: func(_ context.Context, _ *ir.DAG) (bool, bool, error) {
+			return false, false, errors.New("queue read failed")
 		},
 		GenRunID: func(_ context.Context) (string, error) {
 			return "run-1", nil
@@ -1521,8 +1521,8 @@ func TestPlanQueuedRuns(t *testing.T) {
 		queue func(f *queuedRunFixture)
 		want  string
 	}{
-		{"Manual", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, queuedAt) }, runDispatched},
-		{"Webhook", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeWebhook, time.Time{}, queuedAt) }, runDispatched},
+		{"Manual", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, queuedAt) }, runEnqueued},
+		{"Webhook", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeWebhook, time.Time{}, queuedAt) }, runEnqueued},
 		{"Scheduled", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeScheduler, slot, queuedAt) }, runNotStarted},
 		{"CatchUp", func(f *queuedRunFixture) { f.queueRun("queued", ir.TriggerTypeCatchUp, slot, queuedAt) }, runNotStarted},
 		{"ScheduledRetry", func(f *queuedRunFixture) { f.queueRetry("queued", slot, queuedAt) }, runNotStarted},
@@ -2248,8 +2248,9 @@ func TestTickPlanner_DispatchRunStart(t *testing.T) {
 	assert.Equal(t, scheduledTime, gotScheduleTime, "Dispatch callback should receive the scheduled time")
 }
 
-// A scheduled run of a DAG that names a configured queue waits for capacity
-// instead of starting as its schedule fires.
+// A scheduled run of a DAG that names a configured queue, or whose DAG
+// already has runs waiting in its queue, waits for capacity instead of
+// starting as its schedule fires.
 func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 	t.Parallel()
 
@@ -2262,6 +2263,15 @@ func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 		Enqueue: func(_ context.Context, _ DAGEntry, _ string, _ ir.TriggerType, _ time.Time) error {
 			enqueued = true
 			return nil
+		},
+		IsQueued: func(_ context.Context, dag *ir.DAG) (bool, bool, error) {
+			switch dag.Name {
+			case "waiting-dag":
+				return true, false, nil
+			case "unreadable-dag":
+				return false, false, errors.New("queue read failed")
+			}
+			return false, false, nil
 		},
 		QueuesEnabled:  true,
 		HasGlobalQueue: func(dag *ir.DAG) bool { return dag.Queue == "paced" },
@@ -2289,6 +2299,19 @@ func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 	})
 	assert.True(t, dispatched, "a run without a configured queue should start directly")
 	assert.False(t, enqueued, "a run without a configured queue should not be enqueued")
+
+	for _, name := range []string{"waiting-dag", "unreadable-dag"} {
+		dispatched, enqueued = false, false
+		tp.DispatchRun(context.Background(), PlannedRun{
+			DAGEntry:      DAGEntry{DAG: &ir.DAG{Name: name}},
+			RunID:         "run-" + name,
+			ScheduledTime: time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC),
+			ScheduleType:  ScheduleTypeStart,
+			TriggerType:   ir.TriggerTypeScheduler,
+		})
+		assert.True(t, enqueued, "%s: a run behind queued runs should be enqueued", name)
+		assert.False(t, dispatched, "%s: a run behind queued runs should not start directly", name)
+	}
 }
 
 func TestTickPlanner_DispatchRunSuspendedStartSkipped(t *testing.T) {
@@ -2766,9 +2789,10 @@ func TestInheritedScheduling(t *testing.T) {
 									require.Equal(t, full.ProcGroup(), dag.ProcGroup())
 									return busy && guard == "running", nil
 								}
-								planner.cfg.IsQueued = func(_ context.Context, dag *ir.DAG) (bool, error) {
+								planner.cfg.IsQueued = func(_ context.Context, dag *ir.DAG) (bool, bool, error) {
 									require.Equal(t, full.ProcGroup(), dag.ProcGroup())
-									return busy && guard == "queued", nil
+									queued := busy && guard == "queued"
+									return queued, queued, nil
 								}
 								planner.cfg.Enqueue = func(_ context.Context, entry DAGEntry, runID string, _ ir.TriggerType, _ time.Time) error {
 									require.Equal(t, full.ProcGroup(), entry.DAG.ProcGroup())

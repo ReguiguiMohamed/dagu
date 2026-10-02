@@ -977,31 +977,32 @@ func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
 	s.planner.DispatchRun(ctx, run)
 }
 
-// newQueuedChecker reports whether a run the scheduler owns is queued for a
-// DAG. Runs queued by hand or by webhook do not hold back the schedule.
+// newQueuedChecker reports the runs queued for a DAG. Only a run the
+// scheduler owns holds a schedule slot; runs queued by hand or by webhook do
+// not hold back the schedule.
 func newQueuedChecker(queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository) IsQueuedFunc {
-	return func(ctx context.Context, dag *ir.DAG) (bool, error) {
+	return func(ctx context.Context, dag *ir.DAG) (bool, bool, error) {
 		items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		for _, item := range items {
 			ref, err := item.Data()
 			if err != nil {
-				return false, err
+				return false, false, err
 			}
 			attempt, err := dagRunRepository.FindAttempt(ctx, *ref)
 			if err != nil {
-				return false, err
+				return false, false, err
 			}
 			status, err := attempt.ReadStatus(ctx)
 			if err != nil {
-				return false, err
+				return false, false, err
 			}
 			if isSchedulerManagedTriggerType(status.TriggerType) {
-				return true, nil
+				return true, true, nil
 			}
 		}
-		return false, nil
+		return len(items) > 0, false, nil
 	}
 }

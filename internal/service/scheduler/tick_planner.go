@@ -73,8 +73,9 @@ type RestartFunc func(ctx context.Context, entry DAGEntry, scheduleTime time.Tim
 // EnqueueFunc enqueues a catchup run for the given DAG.
 type EnqueueFunc func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error
 
-// IsQueuedFunc checks if a DAG has any pending queued items.
-type IsQueuedFunc func(ctx context.Context, dag *ir.DAG) (bool, error)
+// IsQueuedFunc reports whether a run that can still start waits in a DAG's
+// queue, and whether one of those runs holds a schedule slot.
+type IsQueuedFunc func(ctx context.Context, dag *ir.DAG) (queued, scheduled bool, err error)
 
 // HasGlobalQueueFunc reports whether a DAG names a configured queue.
 type HasGlobalQueueFunc func(dag *ir.DAG) bool
@@ -102,7 +103,7 @@ type TickPlannerConfig struct {
 	QueuesEnabled bool
 	// Enqueue enqueues a catchup run. Nil when queues are disabled.
 	Enqueue EnqueueFunc
-	// IsQueued checks if a DAG has any pending queued items.
+	// IsQueued reports the runs waiting in a DAG's queue.
 	IsQueued IsQueuedFunc
 	// HasGlobalQueue reports a DAG whose queue is configured. Its scheduled
 	// runs wait for queue capacity instead of starting as the schedule fires.
@@ -204,7 +205,7 @@ func NewTickPlanner(cfg TickPlannerConfig) *TickPlanner {
 		cfg.Restart = func(context.Context, DAGEntry, time.Time) error { return nil }
 	}
 	if cfg.IsQueued == nil {
-		cfg.IsQueued = func(context.Context, *ir.DAG) (bool, error) { return false, nil }
+		cfg.IsQueued = func(context.Context, *ir.DAG) (bool, bool, error) { return false, false, nil }
 	}
 	if cfg.RunExists == nil {
 		cfg.RunExists = func(context.Context, *ir.DAG, string) (bool, error) {
@@ -561,7 +562,7 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 					running = false
 				}
 
-				queued, qErr := tp.cfg.IsQueued(ctx, item.DAG)
+				_, scheduled, qErr := tp.cfg.IsQueued(ctx, item.DAG)
 				if qErr != nil {
 					logger.Error(ctx, "Failed to check if DAG is queued; deferring catch-up item",
 						tag.DAG(dagName),
@@ -569,7 +570,7 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 					)
 					catchupDeferred = true
 				} else {
-					busy := running || queued
+					busy := running || scheduled
 					if !busy {
 						// For "latest", collapse to most recent before popping.
 						if buf.overlapPolicy == ir.OverlapPolicyLatest && buf.Len() > 1 {
@@ -767,7 +768,7 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 
 	// Guard 1b: isQueued, a scheduler-owned run is waiting in the queue.
 	// On error, conservatively skip (assume busy) to avoid duplicates.
-	queued, qErr := tp.cfg.IsQueued(ctx, dag)
+	_, scheduled, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
 		logger.Error(ctx, "Failed to check if DAG is queued; assuming busy",
 			tag.DAG(dag.Name),
@@ -775,7 +776,7 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 		)
 		return false
 	}
-	if queued {
+	if scheduled {
 		logger.Info(ctx, "Skipping job because a scheduler-managed run is queued",
 			tag.DAG(dag.Name),
 			slog.String("schedule-time", scheduledTime.Format(time.RFC3339)),
@@ -936,7 +937,7 @@ func (tp *TickPlanner) shouldRunOneOff(ctx context.Context, dag *ir.DAG) bool {
 		return false
 	}
 
-	queued, qErr := tp.cfg.IsQueued(ctx, dag)
+	_, scheduled, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
 		logger.Error(ctx, "Failed to check if DAG is queued; assuming busy",
 			tag.DAG(dag.Name),
@@ -944,7 +945,7 @@ func (tp *TickPlanner) shouldRunOneOff(ctx context.Context, dag *ir.DAG) bool {
 		)
 		return false
 	}
-	if queued {
+	if scheduled {
 		return false
 	}
 
@@ -1559,12 +1560,24 @@ func (tp *TickPlanner) recomputeBuffer(ctx context.Context, entry DAGEntry, acti
 
 // queuesRun reports a scheduled run the queue admits rather than one the
 // scheduler starts as its schedule fires, so the queue's capacity paces every
-// run of the DAGs that share it.
-func (tp *TickPlanner) queuesRun(dag *ir.DAG) bool {
-	return tp.cfg.QueuesEnabled &&
-		tp.cfg.Enqueue != nil &&
-		tp.cfg.HasGlobalQueue != nil &&
-		tp.cfg.HasGlobalQueue(dag)
+// run of the DAGs that share it. A run of a DAG that already has runs waiting
+// in its queue is admitted after them.
+func (tp *TickPlanner) queuesRun(ctx context.Context, dag *ir.DAG) bool {
+	if !tp.cfg.QueuesEnabled || tp.cfg.Enqueue == nil {
+		return false
+	}
+	if tp.cfg.HasGlobalQueue != nil && tp.cfg.HasGlobalQueue(dag) {
+		return true
+	}
+	queued, _, err := tp.cfg.IsQueued(ctx, dag)
+	if err != nil {
+		logger.Error(ctx, "Failed to check if DAG is queued; queueing the run",
+			tag.DAG(dag.Name),
+			tag.Error(err),
+		)
+		return true
+	}
+	return queued
 }
 
 // DispatchRun dispatches a PlannedRun using the configured dispatch functions.
@@ -1655,7 +1668,7 @@ func (tp *TickPlanner) DispatchRun(ctx context.Context, run PlannedRun) {
 				return
 			}
 			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
-		} else if tp.queuesRun(run.DAG) {
+		} else if tp.queuesRun(ctx, run.DAG) {
 			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
 		} else {
 			err = tp.cfg.Dispatch(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
