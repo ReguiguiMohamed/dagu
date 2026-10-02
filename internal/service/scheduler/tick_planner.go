@@ -105,6 +105,9 @@ type TickPlannerConfig struct {
 	Enqueue EnqueueFunc
 	// IsQueued reports the runs waiting in a DAG's queue.
 	IsQueued IsQueuedFunc
+	// GetLatestNonQueuedStatus retrieves the latest status of a DAG, passing
+	// over runs that are still queued.
+	GetLatestNonQueuedStatus GetLatestStatusFunc
 	// HasGlobalQueue reports a DAG whose queue is configured. Its scheduled
 	// runs wait for queue capacity instead of starting as the schedule fires.
 	HasGlobalQueue HasGlobalQueueFunc
@@ -206,6 +209,11 @@ func NewTickPlanner(cfg TickPlannerConfig) *TickPlanner {
 	}
 	if cfg.IsQueued == nil {
 		cfg.IsQueued = func(context.Context, *ir.DAG) (bool, bool, error) { return false, false, nil }
+	}
+	if cfg.GetLatestNonQueuedStatus == nil {
+		cfg.GetLatestNonQueuedStatus = func(context.Context, *ir.DAG) (ir.DAGRunStatus, error) {
+			return ir.DAGRunStatus{}, nil
+		}
 	}
 	if cfg.RunExists == nil {
 		cfg.RunExists = func(context.Context, *ir.DAG, string) (bool, error) {
@@ -796,6 +804,19 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 	// Also check status-based running (belt and suspenders)
 	if latestStatus.Status == ir.Running {
 		return false
+	}
+
+	// A queued run has not started, so the guards below judge the latest run
+	// that has.
+	if latestStatus.Status == ir.Queued {
+		latestStatus, err = tp.cfg.GetLatestNonQueuedStatus(ctx, dag)
+		if err != nil {
+			logger.Error(ctx, "Failed to fetch latest non-queued DAG status",
+				tag.DAG(dag.Name),
+				tag.Error(err),
+			)
+			return false
+		}
 	}
 
 	latestScheduleTime, slotState := latestScheduledSlot(latestStatus, schedule)

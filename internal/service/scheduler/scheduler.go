@@ -303,7 +303,8 @@ func newScheduler(
 		HasGlobalQueue: func(dag *ir.DAG) bool {
 			return cfg.FindQueueConfig(dag.ProcGroup()) != nil
 		},
-		IsQueued: isQueued,
+		IsQueued:                 isQueued,
+		GetLatestNonQueuedStatus: newNonQueuedStatusReader(dagRunRepository),
 		RunExists: func(ctx context.Context, dag *ir.DAG, runID string) (bool, error) {
 			_, err := dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, runID))
 			switch {
@@ -1034,4 +1035,25 @@ func readQueuedStatus(ctx context.Context, dagRunRepository *persis.DAGRunReposi
 		return nil, nil
 	}
 	return status, nil
+}
+
+// nonQueuedStatusSearchLimit bounds how many recent runs are read to find the
+// latest one that has left the queue.
+const nonQueuedStatusSearchLimit = 10
+
+// newNonQueuedStatusReader returns the latest status among a DAG's recent runs
+// that are not queued, or the initial status when there is none.
+func newNonQueuedStatusReader(dagRunRepository *persis.DAGRunRepository) GetLatestStatusFunc {
+	return func(ctx context.Context, dag *ir.DAG) (ir.DAGRunStatus, error) {
+		statuses, err := dagRunRepository.RecentStatuses(ctx, dag.Name, nonQueuedStatusSearchLimit)
+		if err != nil {
+			return ir.DAGRunStatus{}, err
+		}
+		for _, status := range statuses {
+			if status.Status != ir.Queued {
+				return status, nil
+			}
+		}
+		return ir.InitialStatus(dag), nil
+	}
 }

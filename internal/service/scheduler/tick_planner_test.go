@@ -1497,6 +1497,7 @@ func (f *queuedRunFixture) planner(now time.Time) *TickPlanner {
 	manager := runtime.NewManager(f.runs, nil, &config.Config{})
 	tp.cfg.IsQueued = newQueuedChecker(f.queue, f.runs)
 	tp.cfg.GetLatestStatus = manager.GetLatestStatus
+	tp.cfg.GetLatestNonQueuedStatus = newNonQueuedStatusReader(f.runs)
 	tp.cfg.Dispatch = func(context.Context, DAGEntry, string, ir.TriggerType, time.Time) error {
 		f.started = runDispatched
 		return nil
@@ -1551,6 +1552,21 @@ func TestPlanQueuedRuns(t *testing.T) {
 			require.Equal(t, tt.want, f.started)
 		})
 	}
+}
+
+// A queued run has not started, so it must not hide an earlier success from
+// skipIfSuccessful.
+func TestPlanQueuedRunKeepsSkipIfSuccessful(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	f := newQueuedRunFixture(t)
+	f.dag.SkipIfSuccessful = true
+	f.writeRun("succeeded", ir.Succeeded, time.Time{}, now.Add(-30*time.Minute))
+	f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, now.Add(-10*time.Minute))
+	tp := f.planner(now)
+
+	require.Empty(t, tp.Plan(t.Context(), now))
 }
 
 func TestTickPlanner_GetLatestStatusErrorSkipsStop(t *testing.T) {
