@@ -1037,23 +1037,29 @@ func readQueuedStatus(ctx context.Context, dagRunRepository *persis.DAGRunReposi
 	return status, nil
 }
 
-// nonQueuedStatusSearchLimit bounds how many recent runs are read to find the
-// latest one that has left the queue.
-const nonQueuedStatusSearchLimit = 10
+// nonQueuedStatusPageSize is the number of recent runs read first when looking
+// for the latest run that has left the queue.
+const nonQueuedStatusPageSize = 10
 
-// newNonQueuedStatusReader returns the latest status among a DAG's recent runs
-// that are not queued, or the initial status when there is none.
+// newNonQueuedStatusReader returns the latest status among a DAG's runs that
+// are not queued, or the initial status when there is none.
 func newNonQueuedStatusReader(dagRunRepository *persis.DAGRunRepository) GetLatestStatusFunc {
 	return func(ctx context.Context, dag *ir.DAG) (ir.DAGRunStatus, error) {
-		statuses, err := dagRunRepository.RecentStatuses(ctx, dag.Name, nonQueuedStatusSearchLimit)
-		if err != nil {
-			return ir.DAGRunStatus{}, err
-		}
-		for _, status := range statuses {
-			if status.Status != ir.Queued {
-				return status, nil
+		// Widen the page until it reaches a run that has left the queue or
+		// the end of the history.
+		for limit := nonQueuedStatusPageSize; ; limit *= 2 {
+			statuses, err := dagRunRepository.RecentStatuses(ctx, dag.Name, limit)
+			if err != nil {
+				return ir.DAGRunStatus{}, err
+			}
+			for _, status := range statuses {
+				if status.Status != ir.Queued {
+					return status, nil
+				}
+			}
+			if len(statuses) < limit {
+				return ir.InitialStatus(dag), nil
 			}
 		}
-		return ir.InitialStatus(dag), nil
 	}
 }

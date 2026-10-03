@@ -1587,8 +1587,8 @@ func TestDispatchAfterQueuedRunStarts(t *testing.T) {
 	require.Equal(t, runEnqueued, f.started)
 }
 
-// A queued run has not started, so it must not hide an earlier success from
-// skipIfSuccessful.
+// Queued runs have not started, so they must not hide an earlier success from
+// skipIfSuccessful, however many of them wait.
 func TestPlanQueuedRunKeepsSkipIfSuccessful(t *testing.T) {
 	t.Parallel()
 
@@ -1596,7 +1596,10 @@ func TestPlanQueuedRunKeepsSkipIfSuccessful(t *testing.T) {
 	f := newQueuedRunFixture(t)
 	f.dag.SkipIfSuccessful = true
 	f.writeRun("succeeded", ir.Succeeded, time.Time{}, now.Add(-30*time.Minute))
-	f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, now.Add(-10*time.Minute))
+	// Queue more runs than one page of history.
+	for i := range nonQueuedStatusPageSize + 1 {
+		f.queueRun(fmt.Sprintf("queued-%02d", i), ir.TriggerTypeManual, time.Time{}, now.Add(-20*time.Minute+time.Duration(i)*time.Second))
+	}
 	tp := f.planner(now)
 
 	require.Empty(t, tp.Plan(t.Context(), now))
