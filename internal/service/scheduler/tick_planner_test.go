@@ -1489,6 +1489,20 @@ func (f *queuedRunFixture) queueRetry(runID string, scheduleTime, at time.Time) 
 	require.True(f.t, queued)
 }
 
+// markStarted moves a queued run to running, as the queue does when it
+// admits the run.
+func (f *queuedRunFixture) markStarted(runID string) {
+	f.t.Helper()
+	attempt, err := f.runs.FindAttempt(f.t.Context(), ir.NewDAGRunRef(f.dag.Name, runID))
+	require.NoError(f.t, err)
+	st, err := attempt.ReadStatus(f.t.Context())
+	require.NoError(f.t, err)
+	st.Status = ir.Running
+	require.NoError(f.t, attempt.Open(f.t.Context()))
+	require.NoError(f.t, attempt.Write(f.t.Context(), *st))
+	require.NoError(f.t, attempt.Close(f.t.Context()))
+}
+
 // planner returns a planner wired to the stores the way the scheduler wires
 // them, recording how each dispatched run is started.
 func (f *queuedRunFixture) planner(now time.Time) *TickPlanner {
@@ -1552,6 +1566,25 @@ func TestPlanQueuedRuns(t *testing.T) {
 			require.Equal(t, tt.want, f.started)
 		})
 	}
+}
+
+// A slot planned behind a queued run joins the queue even when that run
+// starts before the slot is dispatched; starting the slot directly would run
+// it alongside.
+func TestDispatchAfterQueuedRunStarts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	f := newQueuedRunFixture(t)
+	f.queueRun("queued", ir.TriggerTypeManual, time.Time{}, now.Add(-10*time.Minute))
+	tp := f.planner(now)
+
+	runs := tp.Plan(t.Context(), now)
+	require.Len(t, runs, 1)
+	f.markStarted("queued")
+	tp.DispatchRun(t.Context(), runs[0])
+
+	require.Equal(t, runEnqueued, f.started)
 }
 
 // A queued run has not started, so it must not hide an earlier success from
@@ -2274,9 +2307,8 @@ func TestTickPlanner_DispatchRunStart(t *testing.T) {
 	assert.Equal(t, scheduledTime, gotScheduleTime, "Dispatch callback should receive the scheduled time")
 }
 
-// A scheduled run of a DAG that names a configured queue, or whose DAG
-// already has runs waiting in its queue, waits for capacity instead of
-// starting as its schedule fires.
+// A scheduled run of a DAG that names a configured queue waits for capacity
+// instead of starting as its schedule fires.
 func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 	t.Parallel()
 
@@ -2289,15 +2321,6 @@ func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 		Enqueue: func(_ context.Context, _ DAGEntry, _ string, _ ir.TriggerType, _ time.Time) error {
 			enqueued = true
 			return nil
-		},
-		IsQueued: func(_ context.Context, dag *ir.DAG) (bool, bool, error) {
-			switch dag.Name {
-			case "waiting-dag":
-				return true, false, nil
-			case "unreadable-dag":
-				return false, false, errors.New("queue read failed")
-			}
-			return false, false, nil
 		},
 		QueuesEnabled:  true,
 		HasGlobalQueue: func(dag *ir.DAG) bool { return dag.Queue == "paced" },
@@ -2325,19 +2348,6 @@ func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
 	})
 	assert.True(t, dispatched, "a run without a configured queue should start directly")
 	assert.False(t, enqueued, "a run without a configured queue should not be enqueued")
-
-	for _, name := range []string{"waiting-dag", "unreadable-dag"} {
-		dispatched, enqueued = false, false
-		tp.DispatchRun(context.Background(), PlannedRun{
-			DAGEntry:      DAGEntry{DAG: &ir.DAG{Name: name}},
-			RunID:         "run-" + name,
-			ScheduledTime: time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC),
-			ScheduleType:  ScheduleTypeStart,
-			TriggerType:   ir.TriggerTypeScheduler,
-		})
-		assert.True(t, enqueued, "%s: a run behind queued runs should be enqueued", name)
-		assert.False(t, dispatched, "%s: a run behind queued runs should not start directly", name)
-	}
 }
 
 func TestTickPlanner_DispatchRunSuspendedStartSkipped(t *testing.T) {
