@@ -242,7 +242,13 @@ func newScheduler(
 	var isQueued IsQueuedFunc
 	var enqueueFunc EnqueueFunc
 	if queuesEnabled {
-		isQueued = newQueuedChecker(queueStore, dagRunRepository)
+		isQueued = func(ctx context.Context, dag *ir.DAG) (bool, error) {
+			items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
+			if err != nil {
+				return false, err
+			}
+			return len(items) > 0, nil
+		}
 		enqueueFunc = func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error {
 			dag := entry.DAG
 			profileName, err := dagExecutor.defaultProfileName(ctx, entry.DefinitionID, dag)
@@ -303,8 +309,7 @@ func newScheduler(
 		HasGlobalQueue: func(dag *ir.DAG) bool {
 			return cfg.FindQueueConfig(dag.ProcGroup()) != nil
 		},
-		IsQueued:                 isQueued,
-		GetLatestNonQueuedStatus: newNonQueuedStatusReader(dagRunRepository),
+		IsQueued: isQueued,
 		RunExists: func(ctx context.Context, dag *ir.DAG, runID string) (bool, error) {
 			_, err := dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, runID))
 			switch {
@@ -976,90 +981,4 @@ func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
 		}
 	}()
 	s.planner.DispatchRun(ctx, run)
-}
-
-// newQueuedChecker reports the runs queued for a DAG. Only a run started for
-// a schedule slot holds that slot; runs queued by hand, by webhook or by a
-// parent DAG do not hold back the schedule. Queue items the dispatcher would
-// discard are ignored.
-func newQueuedChecker(queueStore queuedomain.QueueStore, dagRunRepository *persis.DAGRunRepository) IsQueuedFunc {
-	return func(ctx context.Context, dag *ir.DAG) (bool, bool, error) {
-		items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
-		if err != nil {
-			return false, false, err
-		}
-		queued := false
-		for _, item := range items {
-			ref, err := item.Data()
-			if err != nil {
-				return false, false, err
-			}
-			status, err := readQueuedStatus(ctx, dagRunRepository, *ref)
-			if err != nil {
-				return false, false, err
-			}
-			if status == nil {
-				continue
-			}
-			// Retries keep the schedule time but not the original trigger type.
-			if status.ScheduleTime != "" {
-				return true, true, nil
-			}
-			queued = true
-		}
-		return queued, false, nil
-	}
-}
-
-// readQueuedStatus returns the status of a queued run, or nil when the run is
-// gone or no longer queued.
-func readQueuedStatus(ctx context.Context, dagRunRepository *persis.DAGRunRepository, ref ir.DAGRunRef) (*ir.DAGRunStatus, error) {
-	attempt, err := dagRunRepository.FindAttempt(ctx, ref)
-	if err != nil {
-		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) || errors.Is(err, dagrun.ErrNoStatusData) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if attempt.Hidden() {
-		return nil, nil
-	}
-	status, err := attempt.ReadStatusUncached(ctx)
-	if err != nil {
-		if errors.Is(err, dagrun.ErrNoStatusData) || errors.Is(err, dagrun.ErrCorruptedStatusData) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if status == nil || status.Status != ir.Queued {
-		return nil, nil
-	}
-	return status, nil
-}
-
-// nonQueuedStatusPageSize is the number of recent runs read first when looking
-// for the latest run that has left the queue.
-const nonQueuedStatusPageSize = 10
-
-// newNonQueuedStatusReader returns the latest status among a DAG's runs that
-// are not queued, or the initial status when there is none.
-func newNonQueuedStatusReader(dagRunRepository *persis.DAGRunRepository) GetLatestStatusFunc {
-	return func(ctx context.Context, dag *ir.DAG) (ir.DAGRunStatus, error) {
-		// Widen the page until it reaches a run that has left the queue or
-		// the end of the history.
-		for limit := nonQueuedStatusPageSize; ; limit *= 2 {
-			statuses, err := dagRunRepository.RecentStatuses(ctx, dag.Name, limit)
-			if err != nil {
-				return ir.DAGRunStatus{}, err
-			}
-			for _, status := range statuses {
-				if status.Status != ir.Queued {
-					return status, nil
-				}
-			}
-			if len(statuses) < limit {
-				return ir.InitialStatus(dag), nil
-			}
-		}
-	}
 }

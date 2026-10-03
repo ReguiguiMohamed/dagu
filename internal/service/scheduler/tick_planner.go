@@ -47,9 +47,6 @@ type PlannedRun struct {
 	ScheduleType  ScheduleType
 	Schedule      ir.Schedule
 	Fingerprint   string
-	// joinQueue is set when runs waited in the DAG's queue as the run was
-	// planned; the queue admits the run after them.
-	joinQueue bool
 }
 
 // DispatchFunc dispatches a catch-up or scheduled run for the given DAG.
@@ -76,9 +73,8 @@ type RestartFunc func(ctx context.Context, entry DAGEntry, scheduleTime time.Tim
 // EnqueueFunc enqueues a catchup run for the given DAG.
 type EnqueueFunc func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error
 
-// IsQueuedFunc reports whether a run that can still start waits in a DAG's
-// queue, and whether one of those runs holds a schedule slot.
-type IsQueuedFunc func(ctx context.Context, dag *ir.DAG) (queued, scheduled bool, err error)
+// IsQueuedFunc checks if a DAG has any pending queued items.
+type IsQueuedFunc func(ctx context.Context, dag *ir.DAG) (bool, error)
 
 // HasGlobalQueueFunc reports whether a DAG names a configured queue.
 type HasGlobalQueueFunc func(dag *ir.DAG) bool
@@ -106,11 +102,8 @@ type TickPlannerConfig struct {
 	QueuesEnabled bool
 	// Enqueue enqueues a catchup run. Nil when queues are disabled.
 	Enqueue EnqueueFunc
-	// IsQueued reports the runs waiting in a DAG's queue.
+	// IsQueued checks if a DAG has any pending queued items.
 	IsQueued IsQueuedFunc
-	// GetLatestNonQueuedStatus retrieves the latest status of a DAG, passing
-	// over runs that are still queued.
-	GetLatestNonQueuedStatus GetLatestStatusFunc
 	// HasGlobalQueue reports a DAG whose queue is configured. Its scheduled
 	// runs wait for queue capacity instead of starting as the schedule fires.
 	HasGlobalQueue HasGlobalQueueFunc
@@ -211,12 +204,7 @@ func NewTickPlanner(cfg TickPlannerConfig) *TickPlanner {
 		cfg.Restart = func(context.Context, DAGEntry, time.Time) error { return nil }
 	}
 	if cfg.IsQueued == nil {
-		cfg.IsQueued = func(context.Context, *ir.DAG) (bool, bool, error) { return false, false, nil }
-	}
-	if cfg.GetLatestNonQueuedStatus == nil {
-		cfg.GetLatestNonQueuedStatus = func(context.Context, *ir.DAG) (ir.DAGRunStatus, error) {
-			return ir.DAGRunStatus{}, nil
-		}
+		cfg.IsQueued = func(context.Context, *ir.DAG) (bool, error) { return false, nil }
 	}
 	if cfg.RunExists == nil {
 		cfg.RunExists = func(context.Context, *ir.DAG, string) (bool, error) {
@@ -573,7 +561,7 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 					running = false
 				}
 
-				_, scheduled, qErr := tp.cfg.IsQueued(ctx, item.DAG)
+				queued, qErr := tp.cfg.IsQueued(ctx, item.DAG)
 				if qErr != nil {
 					logger.Error(ctx, "Failed to check if DAG is queued; deferring catch-up item",
 						tag.DAG(dagName),
@@ -581,7 +569,7 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 					)
 					catchupDeferred = true
 				} else {
-					busy := running || scheduled
+					busy := running || queued
 					if !busy {
 						// For "latest", collapse to most recent before popping.
 						if buf.overlapPolicy == ir.OverlapPolicyLatest && buf.Len() > 1 {
@@ -661,13 +649,11 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 				continue
 			}
 
-			queued, ok := tp.shouldRunOneOff(ctx, entry.DAG)
-			if !ok {
+			if !tp.shouldRunOneOff(ctx, entry.DAG) {
 				continue
 			}
 
 			run, ok := tp.createPlannedRun(ctx, entry.DAGEntry, schedule, oneOffState.ScheduledTime, ir.TriggerTypeScheduler)
-			run.joinQueue = queued
 			if ok && shouldPreferStartCandidate(run, startCandidate, hasStartCandidate) {
 				startCandidate = run
 				hasStartCandidate = true
@@ -683,12 +669,10 @@ func (tp *TickPlanner) Plan(ctx context.Context, now time.Time) []PlannedRun {
 			if !due {
 				continue
 			}
-			queued, ok := tp.shouldRun(ctx, entry.DAG, next, schedule)
-			if !ok {
+			if !tp.shouldRun(ctx, entry.DAG, next, schedule) {
 				continue
 			}
 			run, ok := tp.createPlannedRun(ctx, entry.DAGEntry, schedule, next, ir.TriggerTypeScheduler)
-			run.joinQueue = queued
 			if ok && shouldPreferStartCandidate(run, startCandidate, hasStartCandidate) {
 				startCandidate = run
 				hasStartCandidate = true
@@ -762,9 +746,8 @@ func (tp *TickPlanner) dropInactiveCatchupItems(ctx context.Context, dagName str
 	}
 }
 
-// shouldRun checks all guards for a live scheduled run. start reports whether
-// the run should start, and queued whether runs wait in the DAG's queue.
-func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime time.Time, schedule ir.Schedule) (queued, start bool) {
+// shouldRun checks all guards for a live scheduled run.
+func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime time.Time, schedule ir.Schedule) bool {
 	// Guard 1: isRunning (uses process-level check)
 	running, err := tp.cfg.IsRunning(ctx, dag)
 	if err != nil {
@@ -772,32 +755,32 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 			tag.DAG(dag.Name),
 			tag.Error(err),
 		)
-		return false, false
+		return false
 	}
 	if running {
 		logger.Info(ctx, "Skipping job because the DAG is running",
 			tag.DAG(dag.Name),
 			tag.ScheduledTime(scheduledTime),
 		)
-		return false, false
+		return false
 	}
 
-	// Guard 1b: isQueued, a run started for a schedule slot is waiting in the queue.
+	// Guard 1b: isQueued, a queued run of any trigger keeps the DAG busy, as a running one does.
 	// On error, conservatively skip (assume busy) to avoid duplicates.
-	queued, scheduled, qErr := tp.cfg.IsQueued(ctx, dag)
+	queued, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
 		logger.Error(ctx, "Failed to check if DAG is queued; assuming busy",
 			tag.DAG(dag.Name),
 			tag.Error(qErr),
 		)
-		return false, false
+		return false
 	}
-	if scheduled {
-		logger.Info(ctx, "Skipping job because a scheduled run is queued",
+	if queued {
+		logger.Info(ctx, "Skipping job because a run of the DAG is queued",
 			tag.DAG(dag.Name),
 			tag.ScheduledTime(scheduledTime),
 		)
-		return false, false
+		return false
 	}
 
 	latestStatus, err := tp.cfg.GetLatestStatus(ctx, dag)
@@ -806,25 +789,12 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 			tag.DAG(dag.Name),
 			tag.Error(err),
 		)
-		return false, false
+		return false
 	}
 
 	// Also check status-based running (belt and suspenders)
 	if latestStatus.Status == ir.Running {
-		return false, false
-	}
-
-	// A queued run has not started, so the guards below judge the latest run
-	// that has.
-	if latestStatus.Status == ir.Queued {
-		latestStatus, err = tp.cfg.GetLatestNonQueuedStatus(ctx, dag)
-		if err != nil {
-			logger.Error(ctx, "Failed to fetch latest non-queued DAG status",
-				tag.DAG(dag.Name),
-				tag.Error(err),
-			)
-			return false, false
-		}
+		return false
 	}
 
 	latestScheduleTime, slotState := latestScheduledSlot(latestStatus, schedule)
@@ -832,13 +802,13 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 	case latestScheduledSlotCurrent:
 		// Guard 2: alreadyFinished — exact scheduled slot already completed.
 		if !latestScheduleTime.Before(scheduledTime) {
-			return false, false
+			return false
 		}
 
 		// Guard 3: skipIfSuccessful — only the current schedule's own slots may suppress.
 		if dag.SkipIfSuccessful && latestStatus.Status == ir.Succeeded && schedule.Parsed != nil {
 			if tp.isPreEditSuccess(dag.Name, latestStatus) {
-				return queued, true
+				return true
 			}
 			prevExecTime := computePrevExecTime(scheduledTime, schedule)
 			if !latestScheduleTime.Before(prevExecTime) && latestScheduleTime.Before(scheduledTime) {
@@ -846,15 +816,15 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 					tag.DAG(dag.Name),
 					slog.String("schedule-time", latestScheduleTime.Format(time.RFC3339)),
 				)
-				return false, false
+				return false
 			}
 		}
 
-		return queued, true
+		return true
 	case latestScheduledSlotStale:
 		// The latest run belongs to a removed/edited slot. Do not let its runtime
 		// timestamps suppress the current schedule.
-		return queued, true
+		return true
 	case latestScheduledSlotUnknown:
 		// Fall back to runtime-based suppression when the latest run does not carry
 		// a trustworthy scheduled slot identity.
@@ -864,13 +834,13 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 	latestStartedAt, ok := latestRunReferenceTime(latestStatus)
 	if ok {
 		if !latestStartedAt.Before(scheduledTime) {
-			return false, false
+			return false
 		}
 
 		// Guard 3 fallback: preserve manual-run semantics when no slot identity exists.
 		if dag.SkipIfSuccessful && latestStatus.Status == ir.Succeeded && schedule.Parsed != nil {
 			if tp.isPreEditSuccess(dag.Name, latestStatus) {
-				return queued, true
+				return true
 			}
 			prevExecTime := computePrevExecTime(scheduledTime, schedule)
 			if !latestStartedAt.Before(prevExecTime) && latestStartedAt.Before(scheduledTime) {
@@ -878,12 +848,12 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 					tag.DAG(dag.Name),
 					slog.String("start-time", latestStartedAt.Format(time.RFC3339)),
 				)
-				return false, false
+				return false
 			}
 		}
 	}
 
-	return queued, true
+	return true
 }
 
 func latestRunReferenceTime(status ir.DAGRunStatus) (time.Time, bool) {
@@ -953,32 +923,29 @@ func (tp *TickPlanner) skipSuccessResetAt(dagName string) time.Time {
 	return tp.watermarkState.DAGs[dagName].SkipSuccessResetAt
 }
 
-// shouldRunOneOff checks the guards for a due one-off schedule. start reports
-// whether the run should start, and queued whether runs wait in the DAG's
-// queue.
-func (tp *TickPlanner) shouldRunOneOff(ctx context.Context, dag *ir.DAG) (queued, start bool) {
+func (tp *TickPlanner) shouldRunOneOff(ctx context.Context, dag *ir.DAG) bool {
 	running, err := tp.cfg.IsRunning(ctx, dag)
 	if err != nil {
 		logger.Error(ctx, "Failed to check if DAG is running",
 			tag.DAG(dag.Name),
 			tag.Error(err),
 		)
-		return false, false
+		return false
 	}
 	if running {
-		return false, false
+		return false
 	}
 
-	queued, scheduled, qErr := tp.cfg.IsQueued(ctx, dag)
+	queued, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
 		logger.Error(ctx, "Failed to check if DAG is queued; assuming busy",
 			tag.DAG(dag.Name),
 			tag.Error(qErr),
 		)
-		return false, false
+		return false
 	}
-	if scheduled {
-		return false, false
+	if queued {
+		return false
 	}
 
 	latestStatus, err := tp.cfg.GetLatestStatus(ctx, dag)
@@ -987,10 +954,10 @@ func (tp *TickPlanner) shouldRunOneOff(ctx context.Context, dag *ir.DAG) (queued
 			tag.DAG(dag.Name),
 			tag.Error(err),
 		)
-		return false, false
+		return false
 	}
 
-	return queued, latestStatus.Status != ir.Running
+	return latestStatus.Status != ir.Running
 }
 
 func (tp *TickPlanner) pendingOneOffState(dagName, fingerprint string) (schedulerstate.OneOffScheduleState, bool) {
@@ -1688,7 +1655,7 @@ func (tp *TickPlanner) DispatchRun(ctx context.Context, run PlannedRun) {
 				return
 			}
 			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
-		} else if run.joinQueue || tp.queuesRun(run.DAG) {
+		} else if tp.queuesRun(run.DAG) {
 			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
 		} else {
 			err = tp.cfg.Dispatch(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
